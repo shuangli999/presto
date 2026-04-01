@@ -90,7 +90,7 @@ public class IcebergConfig
     // We default to the coordinator's core count as a proxy, since in most deployments the
     // coordinator and workers use the same instance type. Override this if workers have a
     // different core count or a non-default max-drivers-per-task configuration.
-    private double dynamicFilterWarmupWeightPerTask = Runtime.getRuntime().availableProcessors();
+    private double dynamicFilterWarmupWeightPerTask = 0.5;
 
     @NotNull
     public FileFormat getFileFormat()
