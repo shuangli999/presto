@@ -60,7 +60,6 @@ import jakarta.inject.Inject;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -551,12 +550,6 @@ public class SectionExecutionFactory
     @VisibleForTesting
     static void setExpectedPartitionsForFilters(DynamicFilterService dynamicFilterService, QueryId queryId, PlanNode root, int taskCount)
     {
-        // Get all registered filters for this query
-        Map<String, JoinDynamicFilter> allFilters = dynamicFilterService.getAllFiltersForQuery(queryId);
-        
-        // Collect filter IDs that are actually present in the plan
-        Set<String> activeFilterIds = new HashSet<>();
-        
         List<JoinNode> joinNodes = PlanNodeSearcher.searchFrom(root)
                 .where(node -> node instanceof JoinNode)
                 .findAll().stream()
@@ -564,7 +557,6 @@ public class SectionExecutionFactory
                 .collect(toImmutableList());
 
         for (JoinNode joinNode : joinNodes) {
-            activeFilterIds.addAll(joinNode.getDynamicFilters().keySet());
             for (String filterId : joinNode.getDynamicFilters().keySet()) {
                 dynamicFilterService.getFilter(queryId, filterId)
                         .ifPresent(filter -> filter.setExpectedPartitions(taskCount));
@@ -578,20 +570,9 @@ public class SectionExecutionFactory
                 .collect(toImmutableList());
 
         for (SemiJoinNode semiJoinNode : semiJoinNodes) {
-            activeFilterIds.addAll(semiJoinNode.getDynamicFilters().keySet());
             for (String filterId : semiJoinNode.getDynamicFilters().keySet()) {
                 dynamicFilterService.getFilter(queryId, filterId)
                         .ifPresent(filter -> filter.setExpectedPartitions(taskCount));
-            }
-        }
-        
-        // Mark filters that were registered but not present in the final plan as not generated
-        // This happens when the optimizer decides not to create the filter (e.g., cost-based decision)
-        for (Map.Entry<String, JoinDynamicFilter> entry : allFilters.entrySet()) {
-            String filterId = entry.getKey();
-            if (!activeFilterIds.contains(filterId)) {
-                entry.getValue().markAsNotGenerated(
-                    "Filter not present in final plan (optimizer decided not to generate)");
             }
         }
     }

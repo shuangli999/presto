@@ -2731,11 +2731,13 @@ public class LocalExecutionPlanner
             };
 
             Runnable onCreateOperator = createdCount::incrementAndGet;
+            Consumer<Set<String>> dynamicFilterNotGeneratedConsumer = context.getTaskContext()::markFilterIdsNotGenerated;
 
             return Optional.of(new DynamicFilterSourceOperator.DynamicFilterSourceOperatorFactory(
                     context.getNextOperatorId(),
                     node.getId(),
                     perOperator,
+                    dynamicFilterNotGeneratedConsumer,
                     filterBuildChannels,
                     getDynamicFilteringMaxPerDriverRowCount(context.getSession()),
                     getDynamicFilteringMaxPerDriverSize(context.getSession()),

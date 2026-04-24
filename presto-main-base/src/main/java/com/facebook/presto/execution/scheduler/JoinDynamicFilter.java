@@ -146,13 +146,17 @@ public class JoinDynamicFilter
             long timeoutMs = waitTimeout.toMillis();
             if (timeoutMs > 0) {
                 constraintByFilterIdFuture.completeOnTimeout(TupleDomain.all(), timeoutMs, TimeUnit.MILLISECONDS);
-                if (extendedMetrics) {
-                    constraintByFilterIdFuture.whenComplete((result, throwable) -> {
+                // Always set fullyResolved when future completes (either by timeout or data)
+                constraintByFilterIdFuture.whenComplete((result, throwable) -> {
+                    synchronized (this) {
                         if (!fullyResolved) {
-                            onTimeout();
+                            fullyResolved = true;
+                            if (extendedMetrics) {
+                                onTimeout();
+                            }
                         }
-                    });
-                }
+                    }
+                });
             }
         }
     }

@@ -98,6 +98,7 @@ public class SqlTask
     private final AtomicReference<SettableFuture<Long>> dynamicFilterVersionFuture = new AtomicReference<>();
     private final Set<String> registeredDynamicFilterIds = ConcurrentHashMap.newKeySet();
     private final Set<String> flushedDynamicFilterIds = ConcurrentHashMap.newKeySet();
+    private final Set<String> notGeneratedDynamicFilterIds = ConcurrentHashMap.newKeySet();
 
     public static SqlTask createSqlTask(
             TaskId taskId,
@@ -451,6 +452,7 @@ public class SqlTask
                     Consumer<TupleDomain<String>> dynamicFilterConsumer = this::storeDynamicFilters;
                     Consumer<Set<String>> dynamicFilterIdRegistration = this::registerDynamicFilterIds;
                     Consumer<Set<String>> dynamicFilterIdFlushedCallback = this::markFilterIdsFlushed;
+                    Consumer<Set<String>> dynamicFilterNotGeneratedCallback = this::markFilterIdsNotGenerated;
 
                     taskExecution = sqlTaskExecutionFactory.create(
                             session,
@@ -463,7 +465,8 @@ public class SqlTask
                             tableWriteInfo.get(),
                             Optional.of(dynamicFilterConsumer),
                             Optional.of(dynamicFilterIdRegistration),
-                            Optional.of(dynamicFilterIdFlushedCallback));
+                            Optional.of(dynamicFilterIdFlushedCallback),
+                            Optional.of(dynamicFilterNotGeneratedCallback));
                     taskHolderReference.compareAndSet(taskHolder, new TaskHolder(taskExecution));
                     needsPlan.set(false);
                 }
@@ -651,6 +654,16 @@ public class SqlTask
         }
     }
 
+    public void markFilterIdsNotGenerated(Set<String> filterIds)
+    {
+        notGeneratedDynamicFilterIds.addAll(filterIds);
+        long newVersion = dynamicFilterOutputsVersion.incrementAndGet();
+        SettableFuture<Long> oldFuture = dynamicFilterVersionFuture.getAndSet(null);
+        if (oldFuture != null) {
+            oldFuture.set(newVersion);
+        }
+    }
+
     public boolean isDynamicFilterOperatorCompleted()
     {
         return !registeredDynamicFilterIds.isEmpty()
@@ -752,7 +765,8 @@ public class SqlTask
         Map<String, TupleDomain<String>> filters = getDynamicFiltersSince(sinceVersion);
         boolean operatorCompleted = isDynamicFilterOperatorCompleted();
         Set<String> completedFilterIds = ImmutableSet.copyOf(flushedDynamicFilterIds);
-        return new DynamicFilterResult(filters, version, operatorCompleted, completedFilterIds);
+        Set<String> notGeneratedFilterIds = ImmutableSet.copyOf(notGeneratedDynamicFilterIds);
+        return new DynamicFilterResult(filters, version, operatorCompleted, completedFilterIds, notGeneratedFilterIds);
     }
 
     private static class TaskInstanceId
