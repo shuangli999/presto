@@ -39,7 +39,7 @@
 #include "presto_cpp/main/http/filters/StatsFilter.h"
 #include "presto_cpp/main/operators/BroadcastExchangeSource.h"
 #include "presto_cpp/main/operators/BroadcastWrite.h"
-#include "presto_cpp/main/operators/DynamicFilterSource.h"
+#include "presto_cpp/main/operators/HashBuildFilterWrapper.h"
 #include "presto_cpp/main/operators/LocalShuffle.h"
 #include "presto_cpp/main/operators/PartitionAndSerialize.h"
 #include "presto_cpp/main/operators/ShuffleExchangeSource.h"
@@ -1480,13 +1480,14 @@ void PrestoServer::registerCustomOperators() {
   velox::exec::Operator::registerOperator(
       std::make_unique<operators::ShuffleReadTranslator>());
 
-  velox::exec::Operator::registerOperator(
-      std::make_unique<operators::DynamicFilterSourceTranslator>());
-
   // Todo - Split Presto & Presto-on-Spark server into different classes
   // which will allow server specific operator registration.
   velox::exec::Operator::registerOperator(
       std::make_unique<operators::BroadcastWriteTranslator>());
+
+  // Note: HashBuildFilterWrapper translator is available for future per-driver
+  // DPP extraction but not registered here. DPP currently uses the bridge
+  // callback registered in TaskManager::createOrUpdateTaskImpl.
 }
 
 void PrestoServer::registerFunctions() {

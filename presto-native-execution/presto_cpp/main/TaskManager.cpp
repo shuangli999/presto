@@ -24,6 +24,7 @@
 #include "presto_cpp/main/common/Counters.h"
 #include "presto_cpp/main/common/Utils.h"
 #include "presto_cpp/main/operators/DynamicFilterSource.h"
+#include "presto_cpp/main/operators/HashBuildFilterExtractor.h"
 #include "presto_cpp/main/types/PrestoToVeloxSplit.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/file/FileSystems.h"
@@ -508,12 +509,14 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateTask(
     const protocol::TaskId& taskId,
     const protocol::TaskUpdateRequest& updateRequest,
     const velox::core::PlanFragment& planFragment,
+    const std::vector<JoinDynamicFilterInfo>& dynamicFilterInfos,
     bool summarize,
     std::shared_ptr<velox::core::QueryCtx> queryCtx,
     long startProcessCpuTime) {
   return createOrUpdateTaskImpl(
       taskId,
       planFragment,
+      dynamicFilterInfos,
       updateRequest.sources,
       updateRequest.outputIds,
       summarize,
@@ -525,6 +528,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateBatchTask(
     const protocol::TaskId& taskId,
     const protocol::BatchTaskUpdateRequest& batchUpdateRequest,
     const velox::core::PlanFragment& planFragment,
+    const std::vector<JoinDynamicFilterInfo>& dynamicFilterInfos,
     bool summarize,
     std::shared_ptr<velox::core::QueryCtx> queryCtx,
     long startProcessCpuTime) {
@@ -535,6 +539,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateBatchTask(
   return createOrUpdateTaskImpl(
       taskId,
       planFragment,
+      dynamicFilterInfos,
       updateRequest.sources,
       updateRequest.outputIds,
       summarize,
@@ -545,6 +550,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateBatchTask(
 std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
     const TaskId& taskId,
     const velox::core::PlanFragment& planFragment,
+    const std::vector<JoinDynamicFilterInfo>& dynamicFilterInfos,
     const std::vector<protocol::TaskSource>& sources,
     const protocol::OutputBuffers& outputBuffers,
     bool summarize,
@@ -593,7 +599,8 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
       startTask = true;
       prestoTask->createFinishTimeMs = getCurrentTimeMs();
 
-      // Register dynamic filter callbacks so operators can deliver filters.
+      // Register dynamic filter callbacks so filters can be delivered to
+      // the coordinator.
       auto weakTask = std::weak_ptr<PrestoTask>(prestoTask);
       operators::DynamicFilterCallbackRegistry::instance().registerCallbacks(
           taskId,
@@ -608,6 +615,60 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
               task->registerDynamicFilterIds(filterIds);
             }
           });
+
+      // Register bridge callbacks for distributed dynamic filter extraction.
+      // The bridge callback fires once from the last HashBuild driver after
+      // allPeersFinished, with access to all drivers' hash tables merged.
+      // extractAndDeliverFilters applies a byte-based cap to prevent
+      // ResponseTooLargeException.
+      for (const auto& info : dynamicFilterInfos) {
+        std::unordered_set<std::string> filterIds;
+        for (const auto& ch : info.channels) {
+          filterIds.insert(ch.filterId);
+        }
+        prestoTask->registerDynamicFilterIds(filterIds);
+
+        auto channels = info.channels;
+        auto taskIdCopy = std::string(taskId);
+        // Use a standalone pool from the MemoryManager rather than
+        // a child of the task pool. The bridge callback runs on the
+        // HashBuild driver thread during noMoreInput. Allocations from
+        // a task-child pool can trigger memory arbitration, which
+        // expects the driver to be suspended — but it's running.
+        auto leafPool =
+            velox::memory::MemoryManager::getInstance()->addLeafPool(
+                fmt::format("df_bridge_{}_{}", taskId, info.joinNodeId));
+        auto weakPrestoTask = std::weak_ptr<PrestoTask>(prestoTask);
+        prestoTask->task->registerHashJoinBridgeCallback(
+            info.joinNodeId,
+            [taskIdCopy,
+             channels = std::move(channels),
+             leafPool = std::move(leafPool),
+             weakPrestoTask](
+                const velox::exec::BaseHashTable& mainTable,
+                const std::vector<std::unique_ptr<velox::exec::BaseHashTable>>&
+                    otherTables,
+                bool /*hasNullKeys*/) {
+              try {
+                operators::extractAndDeliverFilters(
+                    taskIdCopy,
+                    channels,
+                    mainTable,
+                    otherTables,
+                    leafPool.get(),
+                    [weakPrestoTask](const std::string& error) {
+                      if (auto pt = weakPrestoTask.lock()) {
+                        pt->recordDppBridgeError(error);
+                      }
+                    });
+              } catch (const std::exception& e) {
+                if (auto pt = weakPrestoTask.lock()) {
+                  pt->recordDppBridgeError(e.what());
+                }
+                throw;
+              }
+            });
+      }
     }
     execTask = prestoTask->task;
   }
@@ -915,6 +976,10 @@ TaskManager::deleteTask(const TaskId& taskId, bool /*abort*/, bool summarize) {
 
   // Remove dynamic filter callback on task deletion.
   operators::DynamicFilterCallbackRegistry::instance().removeCallback(taskId);
+
+  // Wake any long-poll getDynamicFilters waiters so they re-snapshot and
+  // observe operatorCompleted=true for the now-terminal task.
+  prestoTask->wakeDynamicFilterWaiters(0);
 
   std::lock_guard<std::mutex> l(prestoTask->mutex);
   prestoTask->updateHeartbeatLocked();

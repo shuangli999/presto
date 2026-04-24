@@ -256,6 +256,22 @@ struct PrestoTask {
   /// Caller must NOT hold PrestoTask::mutex.
   void applyPendingExternalFilters();
 
+  /// Wakes any long-poll getDynamicFilters waiters. Called when new filter
+  /// data is produced, or externally when the task transitions to a terminal
+  /// state so waiters re-snapshot and observe operatorCompleted=true.
+  void wakeDynamicFilterWaiters(int64_t version);
+
+  /// Records a DPP bridge callback failure. Increments the failure counter
+  /// and captures the first error message (truncated to 500 chars) so it
+  /// appears in query runtime stats for diagnosis without worker logs.
+  void recordDppBridgeError(const std::string& error) {
+    dppBridgeFailed_.fetch_add(1);
+    auto locked = dppBridgeFirstError_.wlock();
+    if (locked->empty()) {
+      *locked = error.substr(0, 500);
+    }
+  }
+
  private:
   // Dynamic filter storage.
   struct VersionedFilter {
@@ -279,6 +295,11 @@ struct PrestoTask {
   // Time (ms) spent waiting for Velox Task::mutex_ in addExternalDynamicFilter.
   std::atomic<int64_t> externalDynamicFilterMutexWaitMs_{0};
 
+  // Count of DPP bridge callback failures (extractAndDeliverFilters threw).
+  std::atomic<int64_t> dppBridgeFailed_{0};
+  // First error message from a failed bridge callback.
+  folly::Synchronized<std::string> dppBridgeFirstError_;
+
   // Pending external dynamic filters that arrived before the Velox Task was
   // created. Applied when the task starts. Protected by PrestoTask::mutex.
   struct PendingExternalFilter {
@@ -298,8 +319,6 @@ struct PrestoTask {
       const std::string& filterId,
       const std::string& scanPlanNodeId,
       const protocol::TupleDomain<std::string>& tupleDomain);
-
-  void wakeDynamicFilterWaiters(int64_t version);
 
   void recordProcessCpuTime();
 

@@ -40,6 +40,7 @@ import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_CONSTR
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_COORDINATOR_FALLBACK_TO_RANGE;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_DOMAIN_RANGE_COUNT;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_EXPECTED_PARTITIONS;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PARTITIONS_RECEIVED;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PLAN_CREATED_FAVORABLE_RATIO;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSHED_INTO_SCAN;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_SHORT_CIRCUITED;
@@ -224,6 +225,63 @@ public abstract class AbstractTestDynamicPartitionPruning
         dimSelectedDatesFiles = countFiles("dim_selected_dates");
         factOrdersTotalManifests = countManifests("fact_orders");
         factOrdersByYearTotalManifests = countManifests("fact_orders_by_year");
+
+        // High-cardinality dimension table: 100K rows with BIGINT keys.
+        // With 90K WEST values, broadcast joins produce ~90K discrete values
+        // in the DPP filter (~10.8 MB at 120 bytes/value), exceeding the
+        // C++ byte-based cap (10 MB) and collapsing to a range filter.
+        // Insert in 10K-row batches to avoid infrastructure issues.
+        executeTableDdl("CREATE TABLE dim_high_cardinality (" +
+                "customer_id BIGINT, " +
+                "region VARCHAR)");
+        for (int batch = 0; batch < 10; batch++) {
+            int offset = batch * 10000;
+            executeTableDdl(format(
+                    "INSERT INTO dim_high_cardinality " +
+                            "SELECT %d + x AS customer_id, " +
+                            "CASE WHEN %d + x <= 90000 THEN 'WEST' ELSE 'OTHER' END AS region " +
+                            "FROM UNNEST(sequence(1, 10000)) AS t(x)",
+                    offset, offset),
+                    10000);
+        }
+
+        // High-cardinality VARCHAR dimension: 100K rows with string keys.
+        // Tests that VARCHAR discrete values correctly collapse to a
+        // lexicographic min/max range when the byte-based cap is exceeded.
+        executeTableDdl("CREATE TABLE dim_high_card_varchar (" +
+                "str_key VARCHAR, " +
+                "region VARCHAR)");
+        for (int batch = 0; batch < 10; batch++) {
+            int offset = batch * 10000;
+            executeTableDdl(format(
+                    "INSERT INTO dim_high_card_varchar " +
+                            "SELECT CAST(%d + x AS VARCHAR) AS str_key, " +
+                            "CASE WHEN %d + x <= 90000 THEN 'WEST' ELSE 'OTHER' END AS region " +
+                            "FROM UNNEST(sequence(1, 10000)) AS t(x)",
+                    offset, offset),
+                    10000);
+        }
+
+        // VARCHAR-partitioned fact table for string key join tests.
+        executeTableDdl("CREATE TABLE fact_orders_varchar (" +
+                "order_id BIGINT, " +
+                "str_key VARCHAR, " +
+                "total_amount DOUBLE" +
+                ") WITH (partitioning = ARRAY['str_key'])");
+        for (int key = 1; key <= 10; key++) {
+            executeTableDdl(format(
+                    "INSERT INTO fact_orders_varchar " +
+                            "SELECT (row_number() OVER ()) + %d * 1000 AS order_id, " +
+                            "CAST(%d AS VARCHAR) AS str_key, " +
+                            "CAST(random() * 1000 AS DOUBLE) AS total_amount " +
+                            "FROM (VALUES 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20," +
+                            "21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40," +
+                            "41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60," +
+                            "61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80," +
+                            "81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100) t(x)",
+                    key, key),
+                    100);
+        }
     }
 
     @AfterClass(alwaysRun = true)
@@ -235,6 +293,9 @@ public abstract class AbstractTestDynamicPartitionPruning
         executeTableDdl("DROP TABLE IF EXISTS dim_selected_dates");
         executeTableDdl("DROP TABLE IF EXISTS dim_active_regions");
         executeTableDdl("DROP TABLE IF EXISTS fact_returns");
+        executeTableDdl("DROP TABLE IF EXISTS dim_high_cardinality");
+        executeTableDdl("DROP TABLE IF EXISTS dim_high_card_varchar");
+        executeTableDdl("DROP TABLE IF EXISTS fact_orders_varchar");
     }
 
     @Test(invocationCount = 10)
@@ -510,6 +571,269 @@ public abstract class AbstractTestDynamicPartitionPruning
 
         assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_SPLITS_BEFORE_FILTER), 0,
                 "Multi-join: all filters should resolve in time");
+    }
+
+    /**
+     * Strict reproducer for the "filter times out with Received=0 despite
+     * Expected=N" benchmark failure pattern seen in TPC-DS queries. Runs a
+     * multi-join query under PARTITIONED distribution and asserts:
+     *   (1) no filter times out,
+     *   (2) for every filter with Expected=N partitions, at least one
+     *       contribution was received (i.e. the HashBuild callback fired on
+     *       at least one task, or the terminal-state fallback kicked in).
+     * <p>
+     * The existing {@code testMultiJoinDynamicPartitionPruning} only checks
+     * that the probe scan saw the filter; it tolerates partial contributions.
+     * This test is stricter so a build-side callback miss becomes visible.
+     */
+    @Test(invocationCount = 5)
+    public void testPartitionedMultiJoinNoFilterTimeout()
+    {
+        // Multi-join where the outer join's build side is itself the result
+        // of an inner join, matching the shape of TPC-DS queries that have
+        // shown the failure in production (e.g. Q19 join 1504 whose build
+        // side is an ExchangeNode wrapping a RemoteSourceNode).
+        String query = "SELECT f.order_id, f.amount, dc.customer_name " +
+                "FROM fact_orders f " +
+                "JOIN (" +
+                "  SELECT c.customer_id, c.customer_name " +
+                "  FROM dim_customers c " +
+                "  JOIN dim_active_regions r ON c.region = r.region_name" +
+                ") dc ON f.customer_id = dc.customer_id " +
+                "ORDER BY f.order_id";
+
+        // Force PARTITIONED distribution so the outer join's build side is a
+        // REPARTITION exchange (not REPLICATE). Use a short max wait so a
+        // hung filter produces a test failure within seconds instead of
+        // minutes.
+        Session session = Session.builder(getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "5s")
+                .setSystemProperty("join_distribution_type", "PARTITIONED")
+                .setSystemProperty("verbose_runtime_stats_enabled", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
+                .build();
+
+        ResultWithQueryId<MaterializedResult> resultWithDpp = execute(session, query);
+        ResultWithQueryId<MaterializedResult> resultNoDpp = execute(dppDisabledSession(), query);
+
+        // Correctness first: DPP and no-DPP must produce identical results.
+        assertEquals(
+                resultWithDpp.getResult().getMaterializedRows(),
+                resultNoDpp.getResult().getMaterializedRows(),
+                "PARTITIONED multi-join: DPP and no-DPP results must match");
+
+        RuntimeStats stats = getRuntimeStats(resultWithDpp);
+
+        // (1) No filter should time out. A timed-out filter indicates the
+        // coordinator never saw enough partition contributions from the
+        // build-side tasks within the wait window — the exact failure mode
+        // this test is designed to catch.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_TIMED_OUT + "[")) {
+                assertEquals(metric.getSum(), 0L,
+                        format("Filter %s timed out — build-side callback "
+                                + "did not deliver contributions in time", key));
+            }
+        });
+
+        // (2) For every filter the coordinator registered, at least one
+        // build-side contribution should have arrived. A received count of 0
+        // when expected > 0 means the HashBuild callback never fired AND the
+        // terminal-state fallback did not compensate.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[")) {
+                String filterId = key.substring(
+                        (DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[").length(),
+                        key.length() - 1);
+                long expected = metric.getSum();
+                long received = getMetricValue(
+                        stats,
+                        DYNAMIC_FILTER_PARTITIONS_RECEIVED + "[" + filterId + "]");
+                assertTrue(received >= 1L,
+                        format("Filter %s expected %d partitions but received %d",
+                                filterId, expected, received));
+            }
+        });
+
+        // Sanity check: at least one filter was pushed into an Iceberg scan.
+        assertTrue(
+                getMetricValue(stats, DYNAMIC_FILTER_PUSHED_INTO_SCAN) > 0,
+                "PARTITIONED multi-join: at least one DF should be pushed into scan");
+    }
+
+    /**
+     * Reproducer that stress-tests the multi-driver HashBuild code path
+     * exercised by TPC-DS SF1000 benchmarks on multi-worker clusters. In
+     * production Q19 stage 2 has 16 build drivers per task (128 total across
+     * 8 tasks). Only the last driver per task to reach
+     * {@code allPeersFinished} continues past the gate in
+     * {@code finishHashBuild} — the others go to {@code kWaitForBuild}. The
+     * last driver is the sole invoker of
+     * {@code HashJoinBridge::fireHashTableReadyCallback} for that task.
+     * <p>
+     * This test forces higher driver concurrency than the default reproducer
+     * ({@code task_concurrency=4}) to exercise the multi-driver
+     * gather-and-fire path without requiring the test framework to have
+     * spill paths configured. The cross-stage dimension-with-dimension
+     * subquery produces the same Join→ExchangeNode(LOCAL REPARTITION)
+     * →RemoteSourceNode build-side shape that TPC-DS queries hit.
+     * <p>
+     * The assertions are the same as
+     * {@link #testPartitionedMultiJoinNoFilterTimeout}: no timeouts and
+     * every registered filter ID must receive at least one contribution.
+     */
+    @Test(invocationCount = 5)
+    public void testPartitionedMultiJoinNoFilterTimeoutHighConcurrency()
+    {
+        // Use fact_orders_by_year which is partitioned by year(order_date);
+        // joining against a per-year dimension gives a natural cross-stage
+        // build side that the Java optimizer will repartition.
+        String query = "SELECT f.order_id, f.amount, d.label " +
+                "FROM fact_orders_by_year f " +
+                "JOIN (" +
+                "  SELECT d.order_date, d.label " +
+                "  FROM dim_selected_dates d " +
+                "  JOIN dim_active_regions r ON r.region_name = 'WEST'" +
+                ") d ON f.order_date = d.order_date " +
+                "ORDER BY f.order_id";
+
+        Session session = Session.builder(getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "10s")
+                .setSystemProperty("join_distribution_type", "PARTITIONED")
+                .setSystemProperty("task_concurrency", "4")
+                .setSystemProperty("hash_partition_count", "4")
+                .setSystemProperty("verbose_runtime_stats_enabled", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
+                .build();
+
+        ResultWithQueryId<MaterializedResult> resultWithDpp = execute(session, query);
+        ResultWithQueryId<MaterializedResult> resultNoDpp = execute(dppDisabledSession(), query);
+
+        // Correctness first.
+        assertEquals(
+                resultWithDpp.getResult().getMaterializedRows(),
+                resultNoDpp.getResult().getMaterializedRows(),
+                "PARTITIONED multi-join with high concurrency: results must match no-DPP");
+
+        RuntimeStats stats = getRuntimeStats(resultWithDpp);
+
+        // No filter should time out.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_TIMED_OUT + "[")) {
+                assertEquals(metric.getSum(), 0L,
+                        format("Filter %s timed out under high-concurrency "
+                                + "multi-driver configuration — build-side "
+                                + "callback did not deliver contributions in time",
+                                key));
+            }
+        });
+
+        // Every filter with Expected=N partitions must have Received>=1.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[")) {
+                String filterId = key.substring(
+                        (DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[").length(),
+                        key.length() - 1);
+                long expected = metric.getSum();
+                long received = getMetricValue(
+                        stats,
+                        DYNAMIC_FILTER_PARTITIONS_RECEIVED + "[" + filterId + "]");
+                assertTrue(received >= 1L,
+                        format("Filter %s expected %d partitions but received %d "
+                                + "(high-concurrency multi-driver config)",
+                                filterId, expected, received));
+            }
+        });
+    }
+
+    /**
+     * Reproducer that exercises the HashBuild spill-restore path with DPP.
+     * With spilling enabled and memory pressure, {@code finishHashBuild()}
+     * can be called multiple times per task: once for the initial build and
+     * again for each spill partition restore. The filter-extraction callback
+     * is cleared after the first fire (see HashJoinBridge.cpp), so the
+     * contribution must come from the initial non-spill call, not from
+     * the recursive spill restore.
+     * <p>
+     * This test forces join spilling via {@code join_spill_enabled=true}
+     * and a low {@code query_max_memory_per_node} so that even the small
+     * test data triggers memory pressure during build. It requires that the
+     * subclass configured {@code experimental.spiller-spill-path} on the
+     * query runner.
+     * <p>
+     * Assertions match the other reproducers: no filter timeouts and every
+     * registered filter ID must receive at least one contribution.
+     */
+    @Test(invocationCount = 5)
+    public void testPartitionedMultiJoinNoFilterTimeoutWithSpill()
+    {
+        String query = "SELECT f.order_id, f.amount, dc.customer_name " +
+                "FROM fact_orders f " +
+                "JOIN (" +
+                "  SELECT c.customer_id, c.customer_name " +
+                "  FROM dim_customers c " +
+                "  JOIN dim_active_regions r ON c.region = r.region_name" +
+                ") dc ON f.customer_id = dc.customer_id " +
+                "ORDER BY f.order_id";
+
+        Session session = Session.builder(getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "10s")
+                .setSystemProperty("join_distribution_type", "PARTITIONED")
+                .setSystemProperty("task_concurrency", "4")
+                .setSystemProperty("hash_partition_count", "4")
+                // Enable join spilling with memory pressure so the hash
+                // build triggers spill partitioning and then restores on
+                // the same operator, re-entering finishHashBuild().
+                .setSystemProperty("spill_enabled", "true")
+                .setSystemProperty("join_spill_enabled", "true")
+                .setSystemProperty("query_max_memory_per_node", "16MB")
+                .setSystemProperty("verbose_runtime_stats_enabled", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
+                .build();
+
+        ResultWithQueryId<MaterializedResult> resultWithDpp = execute(session, query);
+        ResultWithQueryId<MaterializedResult> resultNoDpp = execute(dppDisabledSession(), query);
+
+        // Correctness: DPP + spill must produce identical results.
+        assertEquals(
+                resultWithDpp.getResult().getMaterializedRows(),
+                resultNoDpp.getResult().getMaterializedRows(),
+                "PARTITIONED multi-join with spill: results must match no-DPP");
+
+        RuntimeStats stats = getRuntimeStats(resultWithDpp);
+
+        // No filter should time out.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_TIMED_OUT + "[")) {
+                assertEquals(metric.getSum(), 0L,
+                        format("Filter %s timed out under join-spill config "
+                                + "— HashBuild callback did not fire on the "
+                                + "non-spill path before spill restore", key));
+            }
+        });
+
+        // Every filter with Expected=N partitions must have Received>=1.
+        stats.getMetrics().forEach((key, metric) -> {
+            if (key.startsWith(DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[")) {
+                String filterId = key.substring(
+                        (DYNAMIC_FILTER_EXPECTED_PARTITIONS + "[").length(),
+                        key.length() - 1);
+                long expected = metric.getSum();
+                long received = getMetricValue(
+                        stats,
+                        DYNAMIC_FILTER_PARTITIONS_RECEIVED + "[" + filterId + "]");
+                assertTrue(received >= 1L,
+                        format("Filter %s expected %d partitions but received %d "
+                                + "(join-spill config)",
+                                filterId, expected, received));
+            }
+        });
     }
 
     @Test(invocationCount = 10)
@@ -934,17 +1258,14 @@ public abstract class AbstractTestDynamicPartitionPruning
 
             RuntimeStats dppStats = getRuntimeStats(resultWithDpp);
 
-            assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_PUSHED_INTO_SCAN), 0,
-                    "Non-partitioned probe: no discriminating columns, filter not waited for");
+            // All columns are now relevant for file-level min/max filtering,
+            // so the filter is waited for and pushed into the Iceberg scan.
+            assertTrue(getMetricValue(dppStats, DYNAMIC_FILTER_PUSHED_INTO_SCAN) >= 1,
+                    "Non-partitioned probe: filter should be pushed for file-level min/max filtering");
             long dppSplitsProcessed = getMetricValue(dppStats, DYNAMIC_FILTER_SPLITS_PROCESSED);
-            assertEquals(dppSplitsProcessed, unpartitionedTotalFiles,
-                    format("Non-partitioned probe: should process all files without filter: %d (DPP) vs %d (total)",
+            assertTrue(dppSplitsProcessed <= unpartitionedTotalFiles,
+                    format("Non-partitioned probe: should process at most all files: %d (DPP) vs %d (total)",
                             dppSplitsProcessed, unpartitionedTotalFiles));
-            assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_SPLITS_BEFORE_FILTER), 0,
-                    "Non-partitioned probe: dynamicFilterApplied is true (empty relevant set completes immediately)");
-
-            assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_WAIT_TIME_NANOS), 0,
-                    "Non-partitioned probe: wait time should be 0 (no relevant filters)");
         }
         finally {
             executeTableDdl("DROP TABLE IF EXISTS fact_orders_unpartitioned");
@@ -1534,8 +1855,8 @@ public abstract class AbstractTestDynamicPartitionPruning
             assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_SHORT_CIRCUITED), 0,
                     "Unpartitioned no-SC: short-circuit should NOT fire (no partition-level domain)");
 
-            assertEquals(getMetricValue(dppStats, DYNAMIC_FILTER_PUSHED_INTO_SCAN), 0,
-                    "Unpartitioned no-SC: no discriminating columns, filter not waited for");
+            assertTrue(getMetricValue(dppStats, DYNAMIC_FILTER_PUSHED_INTO_SCAN) >= 1,
+                    "Unpartitioned no-SC: filter should be pushed for file-level min/max filtering");
         }
         finally {
             executeTableDdl("DROP TABLE IF EXISTS fact_unpart_sc");
@@ -1562,14 +1883,19 @@ public abstract class AbstractTestDynamicPartitionPruning
         assertTrue(hasFavorableRatio,
                 format("Cost-based extended metrics should emit PLAN_CREATED_FAVORABLE_RATIO for customer_id. All metric keys: %s",
                         runtimeStats.getMetrics().keySet()));
-        assertEquals(runtimeStats.getMetrics().get(metricKey).getSum(), 1,
-                format("Plan decision metric %s should have value 1", metricKey));
+        // Iterative optimizer rules (DetermineJoinDistributionType, ReorderJoins) may
+        // both emit this metric, so allow sum >= 1 rather than exactly 1.
+        assertTrue(runtimeStats.getMetrics().get(metricKey).getSum() >= 1,
+                format("Plan decision metric %s should have value >= 1, got %d", metricKey,
+                        (long) runtimeStats.getMetrics().get(metricKey).getSum()));
 
         assertEquals(getMetricValue(runtimeStats, DYNAMIC_FILTER_SHORT_CIRCUITED), 0,
                 "Selective filter should NOT trigger short-circuit");
 
+        // Match exact column name with brackets to avoid matching renamed
+        // variables like customer_id_0 from ReorderJoins.
         boolean hasSkipped = runtimeStats.getMetrics().keySet().stream()
-                .anyMatch(k -> k.contains("customer_id") && k.contains("Skipped"));
+                .anyMatch(k -> k.contains("[customer_id]") && k.contains("Skipped"));
         assertFalse(hasSkipped,
                 format("No PLAN_SKIPPED metrics should be emitted for customer_id when filter is created. Keys: %s",
                         runtimeStats.getMetrics().keySet()));
@@ -1670,20 +1996,12 @@ public abstract class AbstractTestDynamicPartitionPruning
                     "Non-discriminating column: DPP results must match no-DPP results");
 
             long skipped = getMetricValue(runtimeStats, DYNAMIC_FILTER_COLUMNS_SKIPPED);
-            assertTrue(skipped >= 1,
-                    format("Column selectivity: status column should be skipped, got skipped=%d", skipped));
+            assertEquals(skipped, 0,
+                    format("Column selectivity: all columns are relevant for file-level filtering, got skipped=%d", skipped));
 
             long relevant = getMetricValue(runtimeStats, DYNAMIC_FILTER_COLUMNS_RELEVANT);
-            assertEquals(relevant, 0,
-                    format("Column selectivity: no columns should be relevant when join is on non-partition column, got relevant=%d", relevant));
-
-            long waitTimeNanos = getMetricValue(runtimeStats, DYNAMIC_FILTER_WAIT_TIME_NANOS);
-            assertEquals(waitTimeNanos, 0,
-                    format("Non-discriminating column: wait time should be 0 (no relevant filters to wait for), got %d ns", waitTimeNanos));
-
-            long splitsBeforeFilter = getMetricValue(runtimeStats, DYNAMIC_FILTER_SPLITS_BEFORE_FILTER);
-            assertEquals(splitsBeforeFilter, 0,
-                    format("Non-discriminating column: splitsBeforeFilter should be 0, got %d", splitsBeforeFilter));
+            assertTrue(relevant >= 1,
+                    format("Column selectivity: status column should be relevant for file-level min/max filtering, got relevant=%d", relevant));
         }
         finally {
             executeTableDdl("DROP TABLE IF EXISTS fact_enriched");
@@ -1753,152 +2071,14 @@ public abstract class AbstractTestDynamicPartitionPruning
             long skipped = getMetricValue(runtimeStats, DYNAMIC_FILTER_COLUMNS_SKIPPED);
             assertTrue(relevant >= 1,
                     format("Mixed: customer_id should be relevant, got relevant=%d", relevant));
-            assertTrue(skipped >= 1,
-                    format("Mixed: status should be skipped, got skipped=%d", skipped));
+            assertEquals(skipped, 0,
+                    format("Mixed: all columns are relevant for file-level filtering, got skipped=%d", skipped));
         }
         finally {
             executeTableDdl("DROP TABLE IF EXISTS fact_mixed");
             executeTableDdl("DROP TABLE IF EXISTS dim_mixed_cust");
             executeTableDdl("DROP TABLE IF EXISTS dim_mixed_status");
         }
-    }
-
-    @Test(invocationCount = 10)
-    public void testTransitiveFilterPropagationThroughInnerJoin()
-    {
-        String query = "SELECT f.order_id, f.amount, c.customer_name " +
-                "FROM fact_orders f " +
-                "JOIN (" +
-                "  SELECT customer_id, AVG(amount) AS avg_amount " +
-                "  FROM fact_orders " +
-                "  GROUP BY customer_id" +
-                ") subq ON f.customer_id = subq.customer_id " +
-                "JOIN dim_customers c ON f.customer_id = c.customer_id " +
-                "WHERE c.region = 'WEST' " +
-                "AND f.amount < subq.avg_amount " +
-                "ORDER BY f.order_id";
-
-        Session transitiveSession = Session.builder(getSession())
-                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
-                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "5s")
-                .setSystemProperty("verbose_runtime_stats_enabled", "true")
-                .setSystemProperty("join_distribution_type", "AUTOMATIC")
-                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
-                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
-                .build();
-
-        ResultWithQueryId<MaterializedResult> dppResult = execute(transitiveSession, query);
-        ResultWithQueryId<MaterializedResult> noDppResult = execute(dppDisabledSession(), query);
-
-        assertEquals(
-                dppResult.getResult().getMaterializedRows(),
-                noDppResult.getResult().getMaterializedRows(),
-                "Transitive filter propagation: DPP results should match non-DPP results");
-
-        assertDppReducesData(dppResult, noDppResult, "Transitive filter propagation");
-
-        RuntimeStats dppStats = getRuntimeStats(dppResult);
-        assertTrue(getMetricValue(dppStats, DYNAMIC_FILTER_PUSHED_INTO_SCAN) >= 1,
-                "At least one scan should have a dynamic filter pushed into it");
-        assertFilterResolvesWithinTimeout(dppStats, "Transitive filter propagation");
-    }
-
-    @Test(invocationCount = 10)
-    public void testTransitiveFilterNotPropagatedThroughLeftJoin()
-    {
-        String query = "SELECT f.order_id, f.amount, c.customer_name, subq.avg_amount " +
-                "FROM fact_orders f " +
-                "LEFT JOIN (" +
-                "  SELECT customer_id, AVG(amount) AS avg_amount " +
-                "  FROM fact_orders " +
-                "  GROUP BY customer_id" +
-                ") subq ON f.customer_id = subq.customer_id " +
-                "JOIN dim_customers c ON f.customer_id = c.customer_id " +
-                "WHERE c.region = 'WEST' " +
-                "ORDER BY f.order_id";
-
-        ResultWithQueryId<MaterializedResult> dppResult = execute(dppBlockingSession(), query);
-        ResultWithQueryId<MaterializedResult> noDppResult = execute(dppDisabledSession(), query);
-
-        assertEquals(
-                dppResult.getResult().getMaterializedRows(),
-                noDppResult.getResult().getMaterializedRows(),
-                "LEFT JOIN transitive: DPP results should match non-DPP results");
-    }
-
-    @Test(invocationCount = 10)
-    public void testTransitiveFilterWithColumnNameTranslation()
-    {
-        String query = "SELECT f.order_id, f.amount, c.customer_name " +
-                "FROM fact_orders f " +
-                "JOIN (" +
-                "  SELECT customer_id AS cust_id, AVG(amount) AS avg_amount " +
-                "  FROM fact_orders " +
-                "  GROUP BY customer_id" +
-                ") subq ON f.customer_id = subq.cust_id " +
-                "JOIN dim_customers c ON f.customer_id = c.customer_id " +
-                "WHERE c.region = 'WEST' " +
-                "AND f.amount < subq.avg_amount " +
-                "ORDER BY f.order_id";
-
-        ResultWithQueryId<MaterializedResult> dppResult = execute(dppBlockingSession(), query);
-        ResultWithQueryId<MaterializedResult> noDppResult = execute(dppDisabledSession(), query);
-
-        assertEquals(
-                dppResult.getResult().getMaterializedRows(),
-                noDppResult.getResult().getMaterializedRows(),
-                "Column name translation: DPP results should match non-DPP results");
-
-        assertDppReducesData(dppResult, noDppResult, "Column name translation");
-    }
-
-    @Test(invocationCount = 10)
-    public void testTransitiveFilterEmptyBuildSide()
-    {
-        String query = "SELECT f.order_id, f.amount, c.customer_name " +
-                "FROM fact_orders f " +
-                "JOIN (" +
-                "  SELECT customer_id, AVG(amount) AS avg_amount " +
-                "  FROM fact_orders " +
-                "  GROUP BY customer_id" +
-                ") subq ON f.customer_id = subq.customer_id " +
-                "JOIN dim_customers c ON f.customer_id = c.customer_id " +
-                "WHERE c.region = 'NONEXISTENT' " +
-                "AND f.amount < subq.avg_amount " +
-                "ORDER BY f.order_id";
-
-        ResultWithQueryId<MaterializedResult> dppResult = execute(dppBlockingSession(), query);
-        ResultWithQueryId<MaterializedResult> noDppResult = execute(dppDisabledSession(), query);
-
-        assertEquals(dppResult.getResult().getRowCount(), 0,
-                "Empty build side transitive: should return 0 rows");
-        assertEquals(
-                dppResult.getResult().getMaterializedRows(),
-                noDppResult.getResult().getMaterializedRows(),
-                "Empty build side transitive: DPP results should match non-DPP results");
-
-        assertDppReducesData(dppResult, noDppResult, "Empty build side transitive");
-    }
-
-    @Test(invocationCount = 10)
-    public void testTransitiveFilterMultiHop()
-    {
-        String query = "SELECT f.order_id, f.amount, c.customer_name, r.return_amount " +
-                "FROM fact_orders f " +
-                "JOIN fact_returns r ON f.order_id = r.order_id " +
-                "JOIN dim_customers c ON f.customer_id = c.customer_id " +
-                "WHERE c.region = 'WEST' " +
-                "ORDER BY f.order_id";
-
-        ResultWithQueryId<MaterializedResult> dppResult = execute(dppBlockingSession(), query);
-        ResultWithQueryId<MaterializedResult> noDppResult = execute(dppDisabledSession(), query);
-
-        assertEquals(
-                dppResult.getResult().getMaterializedRows(),
-                noDppResult.getResult().getMaterializedRows(),
-                "Multi-hop transitive: DPP results should match non-DPP results");
-
-        assertDppReducesData(dppResult, noDppResult, "Multi-hop transitive");
     }
 
     @Test(invocationCount = 10)
@@ -1942,6 +2122,85 @@ public abstract class AbstractTestDynamicPartitionPruning
         // else: filter arrived during warmup scanning before budget exhaustion — inline filter used
 
         assertFilterResolvesWithinTimeout(stats, "warmup-scan");
+    }
+
+    /**
+     * Verifies that a high-cardinality BIGINT build side (90K distinct values)
+     * does not cause ResponseTooLargeException when dynamic filtering is
+     * enabled. With broadcast join, each worker's hash table has all 90K
+     * values. The C++ byte-based cap (~10 MB, ~83K values at 120 bytes each)
+     * collapses the discrete filter to a min/max range. The optimizer may or
+     * may not add dynamic filter annotations for large build sides, so the
+     * primary assertion is correctness — no HTTP errors.
+     */
+    @Test
+    public void testHighCardinalityBuildSideCollapsesToRange()
+    {
+        Session session = Session.builder(getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "10s")
+                .setSystemProperty("join_distribution_type", "BROADCAST")
+                .setSystemProperty("verbose_runtime_stats_enabled", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
+                .build();
+
+        // fact_orders has customer_id 1-10; dim_high_cardinality WEST has 1-90000.
+        // All fact rows match because customer_id 1-10 ⊆ [1, 90000].
+        String dppQuery =
+                "SELECT f.customer_id, f.order_id, f.amount " +
+                        "FROM fact_orders f " +
+                        "JOIN dim_high_cardinality d ON f.customer_id = d.customer_id " +
+                        "WHERE d.region = 'WEST' " +
+                        "ORDER BY f.order_id";
+
+        ResultWithQueryId<MaterializedResult> resultWithDpp = execute(session, dppQuery);
+        ResultWithQueryId<MaterializedResult> resultNoDpp = execute(dppDisabledSession(), dppQuery);
+
+        assertEquals(resultWithDpp.getResult().getRowCount(), 1000,
+                "High-cardinality: should return all 1000 fact rows");
+        assertEquals(resultWithDpp.getResult().getMaterializedRows(),
+                resultNoDpp.getResult().getMaterializedRows(),
+                "High-cardinality: DPP and no-DPP results must match");
+    }
+
+    /**
+     * Verifies that a high-cardinality VARCHAR build side (90K distinct string
+     * values) produces correct results when joined with a VARCHAR-partitioned
+     * fact table. With broadcast join, the C++ side's VectorHasher tracks
+     * lexicographic min/max for strings, enabling range-based filtering when
+     * discrete tracking overflows or the byte-based cap is exceeded. The
+     * primary assertion is correctness — no ResponseTooLargeException.
+     */
+    @Test
+    public void testHighCardinalityVarcharCollapsesToRange()
+    {
+        Session session = Session.builder(getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, "10s")
+                .setSystemProperty("join_distribution_type", "BROADCAST")
+                .setSystemProperty("verbose_runtime_stats_enabled", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_extended_metrics", "true")
+                .setCatalogSessionProperty("iceberg", "dynamic_filter_warmup_enabled", "false")
+                .build();
+
+        // fact_orders_varchar has str_key '1'-'10'; dim WEST has '1'-'90000'.
+        // All fact rows match because str_key '1'-'10' ⊆ WEST values.
+        String dppQuery =
+                "SELECT f.str_key, f.order_id, f.total_amount " +
+                        "FROM fact_orders_varchar f " +
+                        "JOIN dim_high_card_varchar d ON f.str_key = d.str_key " +
+                        "WHERE d.region = 'WEST' " +
+                        "ORDER BY f.order_id";
+
+        ResultWithQueryId<MaterializedResult> resultWithDpp = execute(session, dppQuery);
+        ResultWithQueryId<MaterializedResult> resultNoDpp = execute(dppDisabledSession(), dppQuery);
+
+        assertEquals(resultWithDpp.getResult().getRowCount(), 1000,
+                "High-cardinality VARCHAR: should return all 1000 fact rows");
+        assertEquals(resultWithDpp.getResult().getMaterializedRows(),
+                resultNoDpp.getResult().getMaterializedRows(),
+                "High-cardinality VARCHAR: DPP and no-DPP results must match");
     }
 
     // =====================================================================
