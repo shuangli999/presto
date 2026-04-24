@@ -384,8 +384,6 @@ public class JoinDynamicFilter
                 mergedConstraint = TupleDomain.all();
                 fullyResolved = true;
                 constraintByFilterIdFuture.complete(mergedConstraint);
-                log.info("Dynamic filter {} will not be generated: {}", filterId, reason);
-                stats.getFilterNotGenerated().update(1);
             }
         }
     }
