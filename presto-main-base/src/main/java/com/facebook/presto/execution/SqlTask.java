@@ -691,6 +691,12 @@ public class SqlTask
                 dynamicFilters.merge(filterId, newFilter, (existing, incoming) ->
                         TupleDomain.columnWiseUnion(ImmutableList.of(existing, incoming)));
                 dynamicFilterVersions.put(filterId, newVersion);
+
+                // Also store in TaskContext for probe-side operators to access
+                SqlTaskExecution taskExecution = taskHolderReference.get().getTaskExecution();
+                if (taskExecution != null) {
+                    taskExecution.getTaskContext().addDistributedDynamicFilter(filterId, dynamicFilters.get(filterId));
+                }
             }
         }
         // Notify waiters even for none() so coordinator detects completion
