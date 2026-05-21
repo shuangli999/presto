@@ -934,19 +934,15 @@ uint64_t SystemConfig::queryMaxMemoryPerNode() const {
 }
 
 uint64_t SystemConfig::dppFilterCacheMaxBytes() const {
-  return optionalProperty(kDppFilterCacheMaxBytes)
-      .transform([](const std::string& v) {
-        return velox::config::toCapacity(v, velox::config::CapacityUnit::BYTE);
-      })
-      .value_or(2ULL << 30);
+  return velox::config::toCapacity(
+      optionalProperty(kDppFilterCacheMaxBytes).value(),
+      velox::config::CapacityUnit::BYTE);
 }
 
 uint64_t SystemConfig::dppFilterPushMaxBodyBytes() const {
-  return optionalProperty(kDppFilterPushMaxBodyBytes)
-      .transform([](const std::string& v) {
-        return velox::config::toCapacity(v, velox::config::CapacityUnit::BYTE);
-      })
-      .value_or(16ULL << 20);
+  return velox::config::toCapacity(
+      optionalProperty(kDppFilterPushMaxBodyBytes).value(),
+      velox::config::CapacityUnit::BYTE);
 }
 
 bool SystemConfig::enableMemoryLeakCheck() const {
