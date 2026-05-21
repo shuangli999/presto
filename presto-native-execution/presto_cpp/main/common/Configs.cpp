@@ -238,6 +238,8 @@ SystemConfig::SystemConfig() {
           BOOL_PROP(kHttpEnableEndpointLatencyFilter, false),
           NUM_PROP(kHttpMaxAllocateBytes, 65536),
           STR_PROP(kQueryMaxMemoryPerNode, "4GB"),
+          STR_PROP(kDppFilterCacheMaxBytes, "2GB"),
+          STR_PROP(kDppFilterPushMaxBodyBytes, "16MB"),
           BOOL_PROP(kEnableMemoryLeakCheck, true),
           NONE_PROP(kRemoteFunctionServerThriftPort),
           BOOL_PROP(kSkipRuntimeStatsInRunningTaskInfo, true),
@@ -929,6 +931,22 @@ uint64_t SystemConfig::queryMaxMemoryPerNode() const {
   return velox::config::toCapacity(
       optionalProperty(kQueryMaxMemoryPerNode).value(),
       velox::config::CapacityUnit::BYTE);
+}
+
+uint64_t SystemConfig::dppFilterCacheMaxBytes() const {
+  return optionalProperty(kDppFilterCacheMaxBytes)
+      .transform([](const std::string& v) {
+        return velox::config::toCapacity(v, velox::config::CapacityUnit::BYTE);
+      })
+      .value_or(2ULL << 30);
+}
+
+uint64_t SystemConfig::dppFilterPushMaxBodyBytes() const {
+  return optionalProperty(kDppFilterPushMaxBodyBytes)
+      .transform([](const std::string& v) {
+        return velox::config::toCapacity(v, velox::config::CapacityUnit::BYTE);
+      })
+      .value_or(16ULL << 20);
 }
 
 bool SystemConfig::enableMemoryLeakCheck() const {
