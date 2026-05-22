@@ -43,3 +43,6 @@ RUN mkdir build && \
                  ../velox/scripts/setup-ubuntu.sh install_adapters && \
                  ../scripts/setup-adapters.sh ) && \
     rm -rf build
+
+# Install jemalloc for memory profiling
+RUN apt-get update && apt-get install -y libjemalloc-dev libjemalloc2 && apt-get clean && rm -rf /var/lib/apt/lists/*

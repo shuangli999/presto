@@ -46,6 +46,9 @@ RUN bash -c "mkdir build && \
                  install_ucx) && \
     rm -rf build"
 
+# Install jemalloc for memory profiling
+RUN dnf install -y jemalloc jemalloc-devel && dnf clean all
+
 # put CUDA binaries on the PATH
 ENV PATH=/usr/local/cuda/bin:${PATH}
 

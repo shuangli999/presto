@@ -77,9 +77,6 @@ option(PRESTO_ENABLE_ARROW_FLIGHT_CONNECTOR "Enable Arrow Flight connector" OFF)
 
 option(PRESTO_ENABLE_SPATIAL "Enable spatial support" ON)
 
-# Option to set Velox memory allocator (e.g., jemalloc)
-set(VELOX_MEMORY_ALLOCATOR "" CACHE STRING "Memory allocator for Velox (e.g., jemalloc)")
-
 # Turn on folly int128 support.
 add_compile_definitions(FOLLY_HAVE_INT128_T=1)
 
