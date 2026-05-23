@@ -44,5 +44,19 @@ RUN mkdir build && \
                  ../scripts/setup-adapters.sh ) && \
     rm -rf build
 
-# Install jemalloc for memory profiling
-RUN apt-get update && apt-get install -y libjemalloc-dev libjemalloc2 && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Build and install jemalloc with profiling support
+RUN apt-get update && \
+    apt-get install -y autoconf wget && \
+    cd /tmp && \
+    wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 && \
+    tar xjf jemalloc-5.3.0.tar.bz2 && \
+    cd jemalloc-5.3.0 && \
+    ./configure --enable-prof --prefix=/usr && \
+    make -j$(nproc) && \
+    make install && \
+    cd / && \
+    rm -rf /tmp/jemalloc* && \
+    apt-get remove -y autoconf wget && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*

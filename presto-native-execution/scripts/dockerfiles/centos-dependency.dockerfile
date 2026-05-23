@@ -46,8 +46,19 @@ RUN bash -c "mkdir build && \
                  install_ucx) && \
     rm -rf build"
 
-# Install jemalloc for memory profiling
-RUN dnf install -y jemalloc jemalloc-devel && dnf clean all
+# Build and install jemalloc with profiling support
+RUN dnf install -y autoconf && \
+    cd /tmp && \
+    curl -L https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 -o jemalloc.tar.bz2 && \
+    tar xjf jemalloc.tar.bz2 && \
+    cd jemalloc-5.3.0 && \
+    ./configure --enable-prof --prefix=/usr && \
+    make -j$(nproc) && \
+    make install && \
+    cd / && \
+    rm -rf /tmp/jemalloc* && \
+    dnf remove -y autoconf && \
+    dnf clean all
 
 # put CUDA binaries on the PATH
 ENV PATH=/usr/local/cuda/bin:${PATH}
