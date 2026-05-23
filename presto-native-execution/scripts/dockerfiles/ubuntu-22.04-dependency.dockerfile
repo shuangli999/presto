@@ -46,7 +46,7 @@ RUN mkdir build && \
 
 # Build and install jemalloc with profiling support
 RUN apt-get update && \
-    apt-get install -y autoconf wget && \
+    apt-get install -y autoconf wget bzip2 && \
     cd /tmp && \
     wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 && \
     tar xjf jemalloc-5.3.0.tar.bz2 && \
@@ -56,7 +56,7 @@ RUN apt-get update && \
     make install && \
     cd / && \
     rm -rf /tmp/jemalloc* && \
-    apt-get remove -y autoconf wget && \
+    apt-get remove -y autoconf wget bzip2 && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

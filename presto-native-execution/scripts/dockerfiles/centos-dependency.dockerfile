@@ -47,7 +47,7 @@ RUN bash -c "mkdir build && \
     rm -rf build"
 
 # Build and install jemalloc with profiling support
-RUN dnf install -y autoconf && \
+RUN dnf install -y autoconf bzip2 && \
     cd /tmp && \
     curl -L https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 -o jemalloc.tar.bz2 && \
     tar xjf jemalloc.tar.bz2 && \
@@ -57,7 +57,7 @@ RUN dnf install -y autoconf && \
     make install && \
     cd / && \
     rm -rf /tmp/jemalloc* && \
-    dnf remove -y autoconf && \
+    dnf remove -y autoconf bzip2 && \
     dnf clean all
 
 # put CUDA binaries on the PATH
