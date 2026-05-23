@@ -14,6 +14,7 @@
 #include "presto_cpp/main/SignalHandler.h"
 #include <folly/io/async/EventBaseManager.h>
 #include <csignal>
+#include <jemalloc/jemalloc.h>
 #include "presto_cpp/main/PrestoServer.h"
 #include "presto_cpp/main/common/Utils.h"
 
@@ -24,11 +25,30 @@ SignalHandler::SignalHandler(PrestoServer* prestoServer)
       prestoServer_(prestoServer) {
   registerSignalHandler(SIGINT);
   registerSignalHandler(SIGTERM);
+  registerSignalHandler(SIGUSR1);
 }
 
 void SignalHandler::signalReceived(int signum) noexcept {
-  PRESTO_SHUTDOWN_LOG(INFO) << "Received signal " << signum;
-  prestoServer_->stop();
+  if (signum == SIGUSR1) {
+    // Trigger jemalloc heap dump
+    PRESTO_SHUTDOWN_LOG(INFO) << "Received SIGUSR1, triggering jemalloc heap dump";
+    try {
+      // Call jemalloc's mallctl interface to trigger heap dump
+      int ret = mallctl("prof.dump", nullptr, nullptr, nullptr, 0);
+      if (ret == 0) {
+        PRESTO_SHUTDOWN_LOG(INFO) << "Heap dump triggered successfully";
+      } else {
+        PRESTO_SHUTDOWN_LOG(ERROR) << "Failed to trigger heap dump, mallctl returned: " << ret;
+      }
+    } catch (const std::exception& e) {
+      PRESTO_SHUTDOWN_LOG(ERROR) << "Exception while triggering heap dump: " << e.what();
+    } catch (...) {
+      PRESTO_SHUTDOWN_LOG(ERROR) << "Unknown exception while triggering heap dump";
+    }
+  } else {
+    PRESTO_SHUTDOWN_LOG(INFO) << "Received signal " << signum;
+    prestoServer_->stop();
+  }
 }
 
 } // namespace facebook::presto
