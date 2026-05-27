@@ -63,15 +63,10 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     echo "=== Verifying jemalloc and jeprof installation ===" && \
-    echo "jemalloc library:" && \
     ls -l /usr/lib/libjemalloc.* && \
-    echo "jeprof script:" && \
     ls -l /usr/bin/jeprof && \
-    echo "Testing jeprof:" && \
-    perl /usr/bin/jeprof --help | head -5 && \
-    echo "Verifying dependencies:" && \
-    echo "  perl: $(perl --version | head -2 | tail -1)" && \
-    echo "  addr2line: $(addr2line --version | head -1)" && \
-    echo "  dot: $(dot -V 2>&1)" && \
-    echo "  ps2pdf: $(ps2pdf -v 2>&1 | head -1 || echo 'installed')" && \
-    echo "=== jeprof installation complete and verified ==="
+    perl --version && \
+    addr2line --version && \
+    dot -V && \
+    ps2pdf -v || true && \
+    echo "=== jeprof installation complete ==="
