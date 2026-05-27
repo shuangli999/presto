@@ -48,7 +48,7 @@ RUN bash -c "mkdir build && \
 
 # Build and install jemalloc with profiling support
 # jeprof requires perl and addr2line (from binutils)
-RUN dnf install -y autoconf bzip2 perl binutils && \
+RUN dnf install -y autoconf bzip2 perl binutils graphviz && \
     cd /tmp && \
     curl -L https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 -o jemalloc.tar.bz2 && \
     tar xjf jemalloc.tar.bz2 && \
@@ -62,7 +62,7 @@ RUN dnf install -y autoconf bzip2 perl binutils && \
     dnf clean all && \
     echo "Verifying jeprof installation:" && \
     ls -l /usr/bin/jeprof && \
-    jeprof --help || echo "jeprof installed but may need runtime dependencies"
+    perl /usr/bin/jeprof --help || echo "jeprof installed but may need runtime dependencies"
 
 # put CUDA binaries on the PATH
 ENV PATH=/usr/local/cuda/bin:${PATH}

@@ -47,7 +47,7 @@ RUN mkdir build && \
 # Build and install jemalloc with profiling support
 # jeprof requires perl and addr2line (from binutils)
 RUN apt-get update && \
-    apt-get install -y autoconf wget bzip2 perl binutils && \
+    apt-get install -y autoconf wget bzip2 perl binutils graphviz && \
     cd /tmp && \
     wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 && \
     tar xjf jemalloc-5.3.0.tar.bz2 && \
@@ -63,4 +63,4 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     echo "Verifying jeprof installation:" && \
     ls -l /usr/bin/jeprof && \
-    jeprof --help || echo "jeprof installed but may need runtime dependencies"
+    perl /usr/bin/jeprof --help || echo "jeprof installed but may need runtime dependencies"
