@@ -43,8 +43,27 @@ FROM ${BASE_IMAGE}
 ENV BUILD_BASE_DIR=_build
 ENV BUILD_DIR=""
 
+# Install jeprof and its runtime dependencies for heap profiling
+# perl: run jeprof script
+# binutils: provides addr2line for symbol resolution
+# graphviz: provides dot for SVG generation
+# ghostscript: provides ps2pdf for PDF generation
+RUN dnf install -y perl binutils graphviz ghostscript && \
+    dnf clean all
+
 COPY --chmod=0775 --from=prestissimo-image /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/presto_cpp/main/presto_server /usr/bin/
 COPY --chmod=0775 --from=prestissimo-image /runtime-libraries/* /usr/lib64/prestissimo-libs/
+COPY --chmod=0755 --from=prestissimo-image /usr/bin/jeprof /usr/bin/
+COPY --chmod=0755 --from=prestissimo-image /usr/lib/libjemalloc.* /usr/lib/
+
+# Verify jeprof and its dependencies are available
+RUN echo "=== Verifying jeprof installation in runtime image ===" && \
+    ls -l /usr/bin/jeprof && \
+    perl --version | head -2 && \
+    addr2line --version | head -1 && \
+    dot -V 2>&1 | head -1 && \
+    ps2pdf -v 2>&1 | head -1 && \
+    echo "=== jeprof ready for heap profiling ==="
 COPY --chmod=0755 ./etc /opt/presto-server/etc
 COPY --chmod=0775 ./entrypoint.sh /opt/entrypoint.sh
 RUN echo "/usr/lib64/prestissimo-libs" > /etc/ld.so.conf.d/prestissimo.conf && ldconfig

@@ -45,9 +45,10 @@ RUN mkdir build && \
     rm -rf build
 
 # Build and install jemalloc with profiling support
-# jeprof requires perl and addr2line (from binutils)
+# jeprof requires: perl (to run the script), binutils (for addr2line),
+# graphviz (for SVG generation), ghostscript (for PDF generation)
 RUN apt-get update && \
-    apt-get install -y autoconf wget bzip2 perl binutils graphviz && \
+    apt-get install -y autoconf wget bzip2 perl binutils graphviz ghostscript && \
     cd /tmp && \
     wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 && \
     tar xjf jemalloc-5.3.0.tar.bz2 && \
@@ -61,6 +62,16 @@ RUN apt-get update && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
-    echo "Verifying jeprof installation:" && \
+    echo "=== Verifying jemalloc and jeprof installation ===" && \
+    echo "jemalloc library:" && \
+    ls -l /usr/lib/libjemalloc.* && \
+    echo "jeprof script:" && \
     ls -l /usr/bin/jeprof && \
-    perl /usr/bin/jeprof --help || echo "jeprof installed but may need runtime dependencies"
+    echo "Testing jeprof:" && \
+    perl /usr/bin/jeprof --help | head -5 && \
+    echo "Verifying dependencies:" && \
+    echo "  perl: $(perl --version | head -2 | tail -1)" && \
+    echo "  addr2line: $(addr2line --version | head -1)" && \
+    echo "  dot: $(dot -V 2>&1)" && \
+    echo "  ps2pdf: $(ps2pdf -v 2>&1 | head -1 || echo 'installed')" && \
+    echo "=== jeprof installation complete and verified ==="

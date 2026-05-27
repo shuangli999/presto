@@ -47,8 +47,9 @@ RUN bash -c "mkdir build && \
     rm -rf build"
 
 # Build and install jemalloc with profiling support
-# jeprof requires perl and addr2line (from binutils)
-RUN dnf install -y autoconf bzip2 perl binutils graphviz && \
+# jeprof requires: perl (to run the script), binutils (for addr2line),
+# graphviz (for SVG generation), ghostscript (for PDF generation)
+RUN dnf install -y autoconf bzip2 perl binutils graphviz ghostscript && \
     cd /tmp && \
     curl -L https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 -o jemalloc.tar.bz2 && \
     tar xjf jemalloc.tar.bz2 && \
@@ -60,9 +61,19 @@ RUN dnf install -y autoconf bzip2 perl binutils graphviz && \
     rm -rf /tmp/jemalloc* && \
     dnf remove -y autoconf bzip2 && \
     dnf clean all && \
-    echo "Verifying jeprof installation:" && \
+    echo "=== Verifying jemalloc and jeprof installation ===" && \
+    echo "jemalloc library:" && \
+    ls -l /usr/lib/libjemalloc.* && \
+    echo "jeprof script:" && \
     ls -l /usr/bin/jeprof && \
-    perl /usr/bin/jeprof --help || echo "jeprof installed but may need runtime dependencies"
+    echo "Testing jeprof:" && \
+    perl /usr/bin/jeprof --help | head -5 && \
+    echo "Verifying dependencies:" && \
+    echo "  perl: $(perl --version | head -2 | tail -1)" && \
+    echo "  addr2line: $(addr2line --version | head -1)" && \
+    echo "  dot: $(dot -V 2>&1)" && \
+    echo "  ps2pdf: $(ps2pdf -v 2>&1 | head -1 || echo 'installed')" && \
+    echo "=== jeprof installation complete and verified ==="
 
 # put CUDA binaries on the PATH
 ENV PATH=/usr/local/cuda/bin:${PATH}
